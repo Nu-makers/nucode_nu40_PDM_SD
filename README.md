@@ -6,7 +6,7 @@
 - Button4 : WAV Play/Stop  
 
 = Button4 + Button2 : Volume Down  
-= Button4 + Button3 : Volume Up(MAX 40)
+= Button4 + Button3 : Volume Up(MAX 40)  
 = Button1 + Button2 : MIC Gain Down  
 = Button1 + Button3 : MIC Gain Up(MAX 250)  
 
