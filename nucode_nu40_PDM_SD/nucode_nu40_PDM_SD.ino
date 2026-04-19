@@ -1,7 +1,7 @@
 //------------------------------------------------------------------------
 //Board Library : NUBoards nRF52 1.0.2
 //Board Select  : NU40DK nRF52840
-// Modified: Hardware I2S + Dynamic Vol + Post-Rec + Smart Wrap OLED Terminal
+// Modified: Hardware I2S + Dynamic Vol + Dynamic Gain + Smart Wrap OLED Terminal
 //------------------------------------------------------------------------
 #include <Adafruit_TinyUSB.h>
 #include <SPI.h>
@@ -71,13 +71,11 @@ void oledPrint(String msg) {
   if (len == 0) {
     pushOledLine("");
   } else {
-    // If the message exceeds 21 characters, cut it and put it on multiple lines
     for (int i = 0; i < len; i += MAX_CHARS_PER_LINE) {
       pushOledLine(msg.substring(i, i + MAX_CHARS_PER_LINE));
     }
   }
 
-  // Redraw screen
   display.clearDisplay();
   display.setCursor(0, 0);
   for (int i = 0; i < MAX_OLED_LINES; i++) {
@@ -98,7 +96,7 @@ volatile int samplesRead;
 volatile bool isRecording = false;
 bool isPlaying = false;
 
-// Post-recording variables for collecting remaining microphone buffer
+// Variables for post-recording (Collecting remaining buffer)
 bool isPostRecording = false;
 unsigned long postRecordUntil = 0;
 
@@ -106,11 +104,16 @@ int maxFileIndex = 0;
 int currentPlayIndex = 0;  
 uint32_t wavDataSize = 0;
 
-// Volume amplification control variables (Max 8x)
+// Volume control variables
 int currentVolume = 5;       
 const int BASE_VOLUME = 5;   
 const int MAX_VOLUME = 40;
 bool btn4UsedAsModifier = false; 
+
+// [Modified] Mic Gain control variables (0 ~ 250 in steps of 25)
+int currentGain = 50;       // Default gain 50
+const int MAX_GAIN = 250;
+bool btn1UsedAsModifier = false; // Flag to prevent recording trigger when used for gain adj
 
 // Multi-button debounce
 #define NUM_BTNS 4
@@ -140,7 +143,6 @@ void initNativeI2S();
 void setup() {
   Serial.begin(115200);
 
-  // Initialize OLED I2C (Pin remapping)
   Wire.setPins(OLED_SDA, OLED_SCL);
   Wire.begin();
   
@@ -148,9 +150,9 @@ void setup() {
     Serial.println("SSD1306 Init Failed!");
   } else {
     display.clearDisplay();
-    display.setTextSize(1);              // Smallest font size
-    display.setTextColor(SSD1306_WHITE); // White text
-    display.setTextWrap(false);          // Disable automatic text wrapping (Manual control)
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextWrap(false);
     display.setCursor(0, 0);
     display.display();
   }
@@ -202,7 +204,9 @@ void setup() {
   PDM.setPins(7, 5, -1);
   PDM.onReceive(onPDMdata);       
   PDM.setBufferSize(BUFF_SIZE);   
-  PDM.setGain(50);                 
+  
+  // [Modified] Apply default gain
+  PDM.setGain(currentGain);                 
 
   if (!PDM.begin(1, 16000)) {     
     oledPrint("PDM Init Failed!");
@@ -234,49 +238,45 @@ void loop()
     btnLastState[i] = reading; 
   }
 
-  // [ BTN1: Record / Stop ]
+  // [ BTN1: Record / Stop (Release Trigger) ]
   if (btnReleased[0]) {
-    if (isPlaying) stopPlayback(); 
-    
-    if (!isRecording) { 
-      isRecording = true; 
-      isPostRecording = false;
-
-      maxFileIndex++; 
-      currentPlayIndex = maxFileIndex;
-      sprintf(logFileName, "REC_%03d.WAV", maxFileIndex);
-      
-      oledPrint("REC START: " + String(logFileName));
-      
-      logFile = SD.open(logFileName, FILE_WRITE);
-      wavDataSize = 0;
-      writeWavHeader(logFile, 0); 
-
-      short temp;
-      while(fifo.lockedPop(temp)) { } 
-    } 
-    else if (!isPostRecording) { 
-      oledPrint("Finishing REC...");  
-      isPostRecording = true;
-      postRecordUntil = millis() + 1000; 
+    // Check if BTN1 was used as a modifier key for Gain adj
+    if (!btn1UsedAsModifier) {
+      if (isPlaying) stopPlayback(); 
+      if (!isRecording) { 
+        isRecording = true; 
+        isPostRecording = false;
+        maxFileIndex++; 
+        currentPlayIndex = maxFileIndex;
+        sprintf(logFileName, "REC_%03d.WAV", maxFileIndex);
+        oledPrint("REC START: " + String(logFileName));
+        logFile = SD.open(logFileName, FILE_WRITE);
+        wavDataSize = 0;
+        writeWavHeader(logFile, 0); 
+        short temp;
+        while(fifo.lockedPop(temp)) { } 
+      } 
+      else if (!isPostRecording) { 
+        oledPrint("Finishing REC...");  
+        isPostRecording = true;
+        postRecordUntil = millis() + 1000; 
+      }
     }
+    btn1UsedAsModifier = false; // Reset modifier flag on release
   }
 
-  // [ Post-recording complete (Actual recording stop processing) ]
+  // Handle actual recording stop after 1.0s buffer collection
   if (isPostRecording && millis() > postRecordUntil) {
     isRecording = false;
     isPostRecording = false;
-
     short temp;
     while(fifo.lockedPop(temp)) {
       logFile.write(byte(temp & 0x00FF)); 
       logFile.write(byte((temp >> 8) & 0xFF));     
       wavDataSize += 2;
     }
-
     logFile.flush(); 
     logFile.close(); 
-    
     logFile = SD.open(logFileName, O_RDWR); 
     if (logFile) {
       logFile.seek(0); 
@@ -286,53 +286,57 @@ void loop()
     }
   }
 
-  // [ BTN2: Previous File OR Volume Down ]
+  // [ BTN2: Prev / Vol Down / Gain Down ]
   if (btnPressed[2]) {
-    if (btnState[1] == LOW) { // Volume down
-      if (currentVolume > 5) {
-        currentVolume -= 5;
-      } else if (currentVolume > 0) {
-        currentVolume -= 1;
-      }
+    if (btnState[1] == LOW) { // BTN4 is pressed (Volume Down)
+      if (currentVolume > 5) currentVolume -= 5;
+      else if (currentVolume > 0) currentVolume -= 1;
       if (currentVolume < 0) currentVolume = 0; 
-      
       oledPrint("Vol DOWN: " + String(currentVolume));
       btn4UsedAsModifier = true; 
-    } else { // Previous file
+    } 
+    else if (btnState[0] == LOW) { // [Added] BTN1 is pressed (Gain Down)
+      if (currentGain >= 25) currentGain -= 25;
+      else currentGain = 0;
+      PDM.setGain(currentGain); // Apply gain immediately
+      oledPrint("Gain DOWN: " + String(currentGain));
+      btn1UsedAsModifier = true; // Mark as modifier usage
+    }
+    else { // Single press (Previous track)
       if (currentPlayIndex > 1) { 
         currentPlayIndex--;
         oledPrint("PREV: REC_" + String(currentPlayIndex));
         if (isPlaying) startPlayback(); 
-      } else {
-        oledPrint("First file!");
-      }
+      } else oledPrint("First file!");
     }
   }
 
-  // [ BTN3: Next File OR Volume Up ]
+  // [ BTN3: Next / Vol Up / Gain Up ]
   if (btnPressed[3]) {
-    if (btnState[1] == LOW) { // Volume up
-      if (currentVolume < 5) {
-        currentVolume += 1;
-      } else if (currentVolume < MAX_VOLUME) {
-        currentVolume += 5;
-      }
+    if (btnState[1] == LOW) { // BTN4 is pressed (Volume Up)
+      if (currentVolume < 5) currentVolume += 1;
+      else if (currentVolume < MAX_VOLUME) currentVolume += 5;
       if (currentVolume > MAX_VOLUME) currentVolume = MAX_VOLUME; 
-      
       oledPrint("Vol UP: " + String(currentVolume));
       btn4UsedAsModifier = true; 
-    } else { // Next file
+    } 
+    else if (btnState[0] == LOW) { // [Added] BTN1 is pressed (Gain Up)
+      if (currentGain <= 225) currentGain += 25;
+      else currentGain = 250;
+      PDM.setGain(currentGain); // Apply gain immediately
+      oledPrint("Gain UP: " + String(currentGain));
+      btn1UsedAsModifier = true; // Mark as modifier usage
+    }
+    else { // Single press (Next track)
       if (currentPlayIndex < maxFileIndex) { 
         currentPlayIndex++;
         oledPrint("NEXT: REC_" + String(currentPlayIndex));
         if (isPlaying) startPlayback(); 
-      } else {
-        oledPrint("Last file!");
-      }
+      } else oledPrint("Last file!");
     }
   }
 
-  // [ BTN4: Play / Stop ]
+  // [ BTN4: Play / Stop (Release Trigger) ]
   if (btnReleased[1]) {
     if (!btn4UsedAsModifier) { 
       if (!isRecording) { 
@@ -343,12 +347,10 @@ void loop()
     btn4UsedAsModifier = false; 
   }
 
-
-  // --- 2. Audio streaming processing (Recording mode) ---
+  // --- 2. Audio streaming processing (Recording) ---
   if (isRecording && samplesRead && logFile) {
     digitalWrite(D0, HIGH);
     digitalWrite(MY_LED_GREEN, LOW); 
-
     short temp;
     while(fifo.lockedPop(temp)) {               
       logFile.write(byte(temp & 0x00FF)); 
@@ -356,46 +358,34 @@ void loop()
       wavDataSize += 2; 
     }
     logFile.flush();             
-    
     digitalWrite(MY_LED_GREEN, HIGH);
     digitalWrite(D0, LOW);       
     samplesRead = 0; 
   }
 
-  // --- 3. Audio streaming processing (Playback mode) ---
+  // --- 3. Audio streaming processing (Playback) ---
   if (isPlaying && !isRecording && playFile) {
     int bytesRead = playFile.read((uint8_t*)monoPlayBuf, sizeof(monoPlayBuf));
-    
     if (bytesRead > 0) {
       int numSamples = bytesRead / 2; 
-      
       for (int i = 0; i < numSamples; i++) {
         int32_t scaledSample = ((int32_t)monoPlayBuf[i] * currentVolume) / BASE_VOLUME;
-        
         if (scaledSample > 32767) scaledSample = 32767;
         else if (scaledSample < -32768) scaledSample = -32768;
-        
         stereoPlayBuf[playBufIdx][i*2]     = (int16_t)scaledSample; 
         stereoPlayBuf[playBufIdx][i*2 + 1] = (int16_t)scaledSample; 
       }
-      
       NRF_I2S->TXD.PTR = (uint32_t)stereoPlayBuf[playBufIdx];
       NRF_I2S->RXTXD.MAXCNT = numSamples; 
-      
       if (!isI2SStarted) {
         NRF_I2S->EVENTS_TXPTRUPD = 0;
         NRF_I2S->TASKS_START = 1;
         isI2SStarted = true;
       }
-      
-      while (NRF_I2S->EVENTS_TXPTRUPD == 0) { /* Wait */ }
+      while (NRF_I2S->EVENTS_TXPTRUPD == 0) { }
       NRF_I2S->EVENTS_TXPTRUPD = 0; 
-      
       playBufIdx = 1 - playBufIdx; 
-      
-    } else {
-      stopPlayback();
-    }
+    } else stopPlayback();
   }
 }
 
@@ -407,35 +397,28 @@ void initNativeI2S() {
   NRF_I2S->PSEL.LRCK  = I2S_LRC_PIN;
   NRF_I2S->PSEL.SDOUT = I2S_DIN_PIN;
   NRF_I2S->PSEL.SDIN  = 0xFFFFFFFF; 
-
   NRF_I2S->CONFIG.MODE     = I2S_CONFIG_MODE_MODE_Master;
   NRF_I2S->CONFIG.FORMAT   = I2S_CONFIG_FORMAT_FORMAT_I2S;
   NRF_I2S->CONFIG.CHANNELS = I2S_CONFIG_CHANNELS_CHANNELS_Stereo;
   NRF_I2S->CONFIG.SWIDTH   = I2S_CONFIG_SWIDTH_SWIDTH_16Bit;
-  
   NRF_I2S->CONFIG.MCKFREQ  = I2S_CONFIG_MCKFREQ_MCKFREQ_32MDIV63; 
   NRF_I2S->CONFIG.RATIO    = I2S_CONFIG_RATIO_RATIO_32X;
-  
   NRF_I2S->CONFIG.TXEN     = 1;
   NRF_I2S->CONFIG.RXEN     = 0;
 }
 
 void startPlayback() {
   if (playFile) playFile.close(); 
-  
   char filename[20];
   sprintf(filename, "REC_%03d.WAV", currentPlayIndex);
-  
   playFile = SD.open(filename, FILE_READ);
   if (playFile) {
     playFile.seek(44); 
     isPlaying = true;
     isI2SStarted = false;
     playBufIdx = 0;
-    
     NRF_I2S->ENABLE = 1; 
     digitalWrite(I2S_SD_MODE, HIGH); 
-    
     oledPrint("PLAY START: " + String(filename));
   } else {
     oledPrint("Play File Error!");
@@ -446,30 +429,23 @@ void startPlayback() {
 void stopPlayback() {
   isPlaying = false;
   if (playFile) playFile.close();
-  
   if (isI2SStarted) {
     memset(stereoPlayBuf[0], 0, sizeof(stereoPlayBuf[0]));
     memset(stereoPlayBuf[1], 0, sizeof(stereoPlayBuf[1]));
-    
     for (int i = 0; i < 30; i++) {
       NRF_I2S->TXD.PTR = (uint32_t)stereoPlayBuf[playBufIdx];
       NRF_I2S->RXTXD.MAXCNT = PLAY_CHUNK_SIZE;
-      
       while (NRF_I2S->EVENTS_TXPTRUPD == 0) {} 
       NRF_I2S->EVENTS_TXPTRUPD = 0;
-      
       playBufIdx = 1 - playBufIdx;
     }
-
     digitalWrite(I2S_SD_MODE, LOW);
     delay(50); 
-
     NRF_I2S->EVENTS_STOPPED = 0;
     NRF_I2S->TASKS_STOP = 1;
     while(NRF_I2S->EVENTS_STOPPED == 0) {}
     isI2SStarted = false;
   }
-
   NRF_I2S->ENABLE = 0;
   digitalWrite(I2S_SD_MODE, LOW); 
   oledPrint("PLAY STOP");
@@ -478,11 +454,9 @@ void stopPlayback() {
 void onPDMdata() {
   digitalWrite(D1, HIGH);
   digitalWrite(MY_LED_BLUE, LOW);
-
   int bytesAvailable = PDM.available();     
   PDM.read(sampleBuffer, bytesAvailable);   
   samplesRead = bytesAvailable / 2;         
-
   if (isRecording) { 
     for(int i = 0; i < samplesRead; i++) {    
       if(!fifo.lockedPush(sampleBuffer[i])) {
@@ -490,7 +464,6 @@ void onPDMdata() {
       }
     }
   }
-
   digitalWrite(MY_LED_BLUE, HIGH);
   digitalWrite(D1, LOW);                    
 }
@@ -502,12 +475,10 @@ void writeWavHeader(File& file, uint32_t dataSize) {
   uint16_t numChannels = 1;      
   uint16_t bitsPerSample = 16;
   uint32_t byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-
   header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
   header[4] = (byte)(fileSize & 0xFF); header[5] = (byte)((fileSize >> 8) & 0xFF);
   header[6] = (byte)((fileSize >> 16) & 0xFF); header[7] = (byte)((fileSize >> 24) & 0xFF);
   header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
-
   header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
   header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0; 
   header[20] = 1; header[21] = 0; 
@@ -518,11 +489,9 @@ void writeWavHeader(File& file, uint32_t dataSize) {
   header[30] = (byte)((byteRate >> 16) & 0xFF); header[31] = (byte)((byteRate >> 24) & 0xFF);
   header[32] = (byte)(numChannels * bitsPerSample / 8); header[33] = 0; 
   header[34] = (byte)bitsPerSample; header[35] = 0;
-
   header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
   header[40] = (byte)(dataSize & 0xFF); header[41] = (byte)((dataSize >> 8) & 0xFF);
   header[42] = (byte)((dataSize >> 16) & 0xFF); header[43] = (byte)((dataSize >> 24) & 0xFF);
-
   file.write(header, 44);
 }
 
@@ -535,6 +504,6 @@ void errorBlink(uint8_t err) {
       digitalWrite(MY_LED_RED, LOW); delay(5);
       digitalWrite(MY_LED_RED, HIGH); delay(200);
     }
-  delay(500);
+    delay(500);
   }
 }
